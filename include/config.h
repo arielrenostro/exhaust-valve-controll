@@ -97,7 +97,7 @@ namespace cfg
     // continuous normal-operation driving, which gives a clearer
     // running-vs-stalled current gap for stall detection (see design.md
     // Decision 12).
-    constexpr uint8_t HOMING_DRIVE_DUTY_PERCENT = 40; // motor duty applied while sweeping to find each stop
+    constexpr uint8_t HOMING_DRIVE_DUTY_PERCENT = MOTOR_DRIVE_DUTY_PERCENT; // motor duty applied while sweeping to find each stop
     constexpr uint16_t POSITION_MIN_RANGE_COUNTS = 100; // below this, control falls back to time-based mode
 
     // Safety guard beyond the literal spec text: if a stall current is never
