@@ -1,220 +1,223 @@
 # Exhaust Valve Driver
 
-Firmware PlatformIO para Arduino Nano que controla uma válvula de escapamento
-(borboleta) acionada por motor DC, pilotado por um módulo BTS7960, com
-realimentação de posição por potenciômetro e alvo definido por PWM de 100Hz
-vindo da ECU.
+PlatformIO firmware for an Arduino Nano that controls an exhaust valve
+(butterfly) driven by a DC motor through a BTS7960 module, with position
+feedback from a potentiometer and a target set by a 100Hz PWM signal coming
+from the ECU.
 
-O desafio central do projeto: **o potenciômetro de posição e o motor
-compartilham o mesmo fio físico**. Um MOSFET multiplexa esse fio entre
-"energizar o motor" e "ler o sinal do potenciômetro", e as duas coisas nunca
-podem acontecer ao mesmo tempo — fazer isso queima o microcontrolador.
-Praticamente toda a arquitetura deste firmware existe para lidar com essa
-restrição com segurança.
+The project's central challenge: **the position potentiometer and the motor
+share the same physical wire**. A MOSFET multiplexes that wire between
+"drive the motor" and "read the potentiometer signal", and the two can never
+happen at the same time — doing so would fry the microcontroller. Practically
+the entire architecture of this firmware exists to handle that constraint
+safely.
 
-## Sumário
+## Table of contents
 
-- [Hardware e pinout](#hardware-e-pinout)
-- [O interlock D7/D9](#o-interlock-d7d9)
-- [Arquitetura do firmware](#arquitetura-do-firmware)
-- [Máquina de estados](#máquina-de-estados)
-- [Simulação do alvo em bancada](#simulação-do-alvo-em-bancada)
-- [Calibração (`include/config.h`)](#calibração-includeconfigh)
-- [Build, upload e testes](#build-upload-e-testes)
-- [Estrutura do projeto](#estrutura-do-projeto)
-- [Status atual e próximos passos](#status-atual-e-próximos-passos)
+- [Hardware and pinout](#hardware-and-pinout)
+- [The D7/D9 interlock](#the-d7d9-interlock)
+- [Firmware architecture](#firmware-architecture)
+- [State machine](#state-machine)
+- [Bench-top target simulation](#bench-top-target-simulation)
+- [Calibration (`include/config.h`)](#calibration-includeconfigh)
+- [Build, upload and tests](#build-upload-and-tests)
+- [Project structure](#project-structure)
+- [Current status and next steps](#current-status-and-next-steps)
 
-## Hardware e pinout
+## Hardware and pinout
 
-| Pino | Função |
+| Pin | Function |
 |------|--------|
-| `D2` | Leitura do PWM de 100Hz da ECU (alvo de abertura), captura não-bloqueante |
-| `D5` | `R_PWM` do BTS7960 |
-| `D6` | `L_PWM` do BTS7960 |
-| `D7` | `R_EN` + `L_EN` do BTS7960 (ligados juntos) |
-| `D9` | Habilita o MOSFET que conecta `A0` ao potenciômetro |
-| `A0` | Leitura analógica do potenciômetro de posição (fio compartilhado com o motor) |
-| `A1` | `R_IS` do BTS7960 — corrente do sentido de abertura |
-| `A2` | `L_IS` do BTS7960 — corrente do sentido de fechamento |
-| `A3` | Tensão da bateria do carro, via divisor resistivo (30,1kΩ / 10kΩ) |
-| `A4` | *(bancada, opcional)* Potenciômetro simulando o PWM da ECU — veja [Simulação do alvo em bancada](#simulação-do-alvo-em-bancada) |
+| `D2` | Reads the ECU's 100Hz PWM (opening target), non-blocking capture |
+| `D5` | BTS7960 `R_PWM` |
+| `D6` | BTS7960 `L_PWM` |
+| `D7` | BTS7960 `R_EN` + `L_EN` (tied together) |
+| `D9` | Enables the MOSFET that connects `A0` to the potentiometer |
+| `A0` | Analog read of the position potentiometer (wire shared with the motor) |
+| `A1` | BTS7960 `R_IS` — opening-direction current |
+| `A2` | BTS7960 `L_IS` — closing-direction current |
+| `A3` | Car battery voltage, via a resistive divider (30.1kΩ / 10kΩ) |
+| `A4` | *(bench only, optional)* Potentiometer simulating the ECU PWM — see [Bench-top target simulation](#bench-top-target-simulation) |
 
-> **Nunca habilitar `D9` junto com `D7`.** Habilitar o motor energiza o fio
-> compartilhado, tornando a leitura de `A0` inválida (e potencialmente
-> perigosa para o pino analógico). Essa regra é garantida em software por um
-> único módulo (`ActuatorInterlock`) — nada mais no firmware tem permissão
-> para tocar em `D5`, `D6`, `D7`, `D9` ou `A0` diretamente.
+> **Never enable `D9` together with `D7`.** Enabling the motor energizes the
+> shared wire, making the `A0` reading invalid (and potentially dangerous for
+> the analog pin). This rule is enforced in software by a single module
+> (`ActuatorInterlock`) — nothing else in the firmware is allowed to touch
+> `D5`, `D6`, `D7`, `D9` or `A0` directly.
 
-## O interlock D7/D9
+![Schematic](docs/schematic.png)
 
-Toda leitura de posição exige desligar o motor, ler o mais rápido possível e
-só então religar — nunca os dois ao mesmo tempo:
+## The D7/D9 interlock
 
-```
-|----- T_DRIVE_MS -----|-settle-|--read--|-settle-|----- proximo drive -----|
- D7=HIGH                D7=LOW    D9=HIGH  D9=LOW    D7=HIGH
- (motor girando)        (motor    (A0       (motor
-                        parado)   lido)     ainda parado)
-```
-
-A corrente (`A1`/`A2`) não sofre dessa limitação — é lida direto do BTS7960,
-então a detecção de batente por corrente continua funcionando com o motor
-ligado, inclusive durante o homing.
-
-## Arquitetura do firmware
+Every position read requires turning the motor off, reading as fast as
+possible, and only then turning it back on — never both at once:
 
 ```
-┌─────────────────────┐     ┌───────────────────────┐
-│   PwmTargetReader     │     │   ActuatorInterlock     │
-│  (D2, interrupt +      │     │  (D7/D9 mutex, dead-time, │
-│   watchdog Timer1)      │     │   direção reversa)         │
-└──────────┬───────────┘     └────────────┬────────────┘
-           │  duty% / validade                  │  drive() / readPositionRaw()
-           v                                    v
-┌─────────────────────────────────────────────────────────────┐
-│                     ValvePositionControl                       │
-│  PID (modo POSICAO) ou dead-reckoning (modo TEMPO)              │
-│  holding-at-stops · fail-safe (sinal perdido) · falha de meio-curso │
-└───────────┬───────────────────────────┬─────────────────────┘
-            │ (re)homing                 │ eventos / telemetria
+|----- T_DRIVE_MS -----|---- settle ----|-- read ---|---- settle ----|----- next drive -----|
+        D7=HIGH              D7=LOW        D9=HIGH        D9=LOW             D7=HIGH
+    (motor running)     (motor stopped)   (A0 read)    (motor idle)
+```
+
+Current (`A1`/`A2`) isn't subject to this limitation — it's read directly
+from the BTS7960 — so stall detection by current keeps working with the
+motor running, including during homing.
+
+## Firmware architecture
+
+```
+┌──────────────────┐     ┌──────────────────────────┐
+│ PwmTargetReader  │     │    ActuatorInterlock     │
+│ (D2, interrupt + │     │ (D7/D9 mutex, dead-time, │
+│ watchdog Timer1) │     │    reverse direction)    │
+└──────────────────┘     └──────────────────────────┘
+          │                            │
+            duty% / valid                drive() / readPositionRaw()
+          v                            v
+┌───────────────────────────────────────────────────────────────┐
+│                     ValvePositionControl                      │
+│       PID (POSITION mode) or dead-reckoning (TIME mode)       │
+│ holding at stops · fail-safe (signal lost) · mid-travel fault │
+└───────────────────────────────────────────────────────────────┘
+            │                            │
+              (re)homing                   events / telemetry
             v                            v
-┌─────────────────────┐     ┌───────────────────────┐
-│  HomingCalibration    │     │        Logger           │
-│  (batente a batente,   │     │  Serial 115200, eventos  │
-│   min/max, tempos)      │     │  + telemetria throttled   │
-└─────────────────────┘     └───────────────────────┘
+┌──────────────────────┐     ┌───────────────────────┐
+│  HomingCalibration   │     │        Logger         │
+│ (stop-to-stop sweep, │     │ Serial 115200, events │
+│  min/max, timings)   │     │ + throttled telemetry │
+└──────────────────────┘     └───────────────────────┘
 ```
 
-Lógica pura e testável nativamente (sem `Arduino.h`) vive em `lib/`:
+Pure logic that's natively testable (no `Arduino.h`) lives in `lib/`:
 `DutyMapping`, `CurrentSense`, `ModeSelection`, `DeadReckoning`,
-`PositionDeadband`, `Pid`. Código que fala com o hardware vive em `src/`.
+`PositionDeadband`, `Pid`. Code that talks to hardware lives in `src/`.
 
-## Máquina de estados
+## State machine
 
 ```
-        LIGA (power on)
-              |
-              v
-      +-------------------+
-      |      HOMING         |<------------------------+
-      |  batente a batente    |                         |
-      +-------------------+                          |
-              |                                        |
-   grava min/max(A0), t_abre, t_fecha                  |
-   escolhe MODO: POSICAO (PID) ou TEMPO (dead-reckoning) |
-              |                                        |
-              v                                        |
-      +-------------------+   sobrecorrente no meio     |
-      |      RUNNING         |------ do curso ------------+
-      |  alvo = duty(D2)       |   (corta motor, refaz
-      |  holding nos batentes    |    homing automaticamente)
-      +-------------------+
-              |
-       D2 sem sinal valido
-              v
-      +-------------------+
-      |      FAILSAFE         |
-      |  vai e segura           |
-      |  TOTALMENTE ABERTA        |
-      +-------------------+
+              POWER ON
+                  |
+                  v
+      ┌──────────────────────┐
+      │        HOMING        │<-----------------------------------+
+      │  stop-to-stop sweep  │                                    |
+      └──────────────────────┘                                    |
+                  |                                               |
+      records min/max(A0), t_open, t_close                        |
+      picks MODE: POSITION (PID) or TIME (dead-reckoning)         |
+                  |                                               |
+                  v                                               |
+      ┌──────────────────────┐                                    |
+      │       RUNNING        │ overcurrent mid-travel              |
+      │  target = duty(D2)   │ (cuts motor, re-homes               |
+      │   holding at stops   │  automatically)                    |
+      └──────────────────────┘------------------------------------+
+                  |
+           D2 signal invalid
+                  v
+      ┌──────────────────────┐
+      │       FAILSAFE       │
+      │ drives to and holds  │
+      │      FULLY OPEN      │
+      └──────────────────────┘
 ```
 
-Como a válvula não tem mola de retorno em nenhum extremo, alcançar um
-batente nunca solta o motor — ele continua empurrando com força reduzida
-(`HOLD_DUTY_PERCENT`), com proteção por corrente que reduz ainda mais essa
-força (e loga um evento) se a corrente de sustentação ficar alta por tempo
-demais.
+Since the valve has no return spring on either end, reaching a stop never
+releases the motor — it keeps pushing at reduced force (`HOLD_DUTY_PERCENT`),
+with current protection that reduces that force further (and logs an event)
+if the holding current stays high for too long.
 
-## Simulação do alvo em bancada
+## Bench-top target simulation
 
-Enquanto não houver um gerador de PWM (ou a própria ECU) disponível para
-testar, o firmware pode ler o alvo de abertura de um **potenciômetro em
-`A4`** em vez do sinal PWM real do `D2`. Controlado por uma única flag em
+Until a PWM generator (or the actual ECU) is available for testing, the
+firmware can read the opening target from a **potentiometer on `A4`**
+instead of the real PWM signal on `D2`. Controlled by a single flag in
 `include/config.h`:
 
 ```cpp
-constexpr bool SIMULATE_TARGET_WITH_POTENTIOMETER = true; // false = usa o D2 real
-constexpr int TARGET_SIM_POT_MAX_COUNTS = 900;             // leitura do A4 que representa 100%
+constexpr bool SIMULATE_TARGET_WITH_POTENTIOMETER = true; // false = use the real D2
+constexpr int TARGET_SIM_POT_MAX_COUNTS = 900;             // A0 reading that represents 100%
 ```
 
-A leitura do `A4` é mapeada de `0` a `900` (não a escala cheia de 0-1023 do
-ADC) para `0-100%` de abertura — ajuste `TARGET_SIM_POT_MAX_COUNTS` se o seu
-potenciômetro não bater exatamente nesses 900. Com a flag em `true`, o
-sinal de fail-safe por perda de PWM (`D2` sem sinal) fica desativado, já
-que não existe um "sinal perdido" equivalente para o potenciômetro — o
-firmware sempre considera o alvo do `A4` válido. O módulo responsável é
-`src/TargetSource.*`, que é o único ponto do código que decide qual das
-duas fontes usar; o resto do firmware (`ValvePositionControl`) não sabe
-nem precisa saber qual está ativa.
+The `A4` reading is mapped from `0` to `900` (not the ADC's full 0-1023
+scale) to `0-100%` opening — adjust `TARGET_SIM_POT_MAX_COUNTS` if your
+potentiometer doesn't hit exactly 900. With the flag set to `true`, the
+fail-safe for PWM signal loss (`D2` with no signal) is disabled, since
+there's no equivalent "signal lost" condition for the potentiometer — the
+firmware always treats the `A4` target as valid. The module responsible is
+`src/TargetSource.*`, the only place in the code that decides which of the
+two sources to use; the rest of the firmware (`ValvePositionControl`)
+doesn't know or need to know which one is active.
 
-Antes de instalar no carro, lembre de voltar a flag para `false` (ou usar o
-gerador de PWM de bancada / a ECU real).
+Before installing in the car, remember to set the flag back to `false` (or
+use the bench PWM generator / the real ECU).
 
-## Calibração (`include/config.h`)
+## Calibration (`include/config.h`)
 
-Todos os valores de calibração são constantes nomeadas e comentadas em
-`include/config.h` — nenhum "número mágico" espalhado pela lógica. Já
-populados com os valores medidos neste hardware:
+All calibration values are named, commented constants in `include/config.h`
+— no "magic numbers" scattered through the logic. Already populated with
+values measured on this hardware:
 
-- Escala de corrente do BTS7960: `0.00V = 0A`, `4.0V = 3.4A`
-- Divisor de tensão da bateria: `20,05V = 5V` no pino (R1=30,1kΩ, R2=10kΩ)
-- Mapeamento do duty do D2: `0% = aberta`, `100% = fechada` (`INVERT_TARGET_DUTY = true`)
+- BTS7960 current scale: `0.00V = 0A`, `4.0V = 3.4A`
+- Battery voltage divider: `20.05V = 5V` at the pin (R1=30.1kΩ, R2=10kΩ)
+- D2 duty mapping: `0% = open`, `100% = closed` (`INVERT_TARGET_DUTY = true`)
 
-Ainda precisam de calibração em bancada antes de ir para o carro:
-`T_DRIVE_MS`, `T_BTS7960_TURNOFF_MS`/`T_READ_MOSFET_TURNOFF_US` (os dois
-dead-times do interlock — o do BTS7960 em milissegundos pelo datasheet, o do
-MOSFET 2N7000 em microssegundos, já que ele chaveia em ~10ns), limiares de
-corrente de batente (`STALL_CURRENT_THRESHOLD_*_AMPS`), ganhos do PID,
-`HOLD_DUTY_PERCENT`, `HOLD_CURRENT_THRESHOLD_AMPS` e o prescaler do ADC. Veja
-`openspec/changes/exhaust-valve-controller/design.md` para o racional de
-cada um.
+Still need bench calibration before going into the car:
+`T_DRIVE_MS`, `T_BTS7960_TURNOFF_MS`/`T_READ_MOSFET_TURNOFF_US` (the
+interlock's two dead-times — the BTS7960's in milliseconds per the
+datasheet, the 2N7000 MOSFET's in microseconds, since it switches in
+~10ns), stall current thresholds (`STALL_CURRENT_THRESHOLD_*_AMPS`), PID
+gains, `HOLD_DUTY_PERCENT`, `HOLD_CURRENT_THRESHOLD_AMPS`, and the ADC
+prescaler. See `openspec/changes/exhaust-valve-controller/design.md` for the
+rationale behind each one.
 
-## Build, upload e testes
+## Build, upload and tests
 
-Projeto PlatformIO padrão — via VS Code + extensão PlatformIO, ou CLI:
+Standard PlatformIO project — via VS Code + the PlatformIO extension, or the
+CLI:
 
 ```bash
-# compilar e gravar no Nano
+# build and flash the Nano
 pio run -e nanoatmega328new -t upload
 
-# monitor serial (115200 baud)
+# serial monitor (115200 baud)
 pio device monitor -b 115200
 
-# rodar os testes unitários da lógica pura (não precisa de hardware)
+# run the pure-logic unit tests (no hardware needed)
 pio test -e native
 ```
 
-## Estrutura do projeto
+## Project structure
 
 ```
-include/config.h          constantes de calibração (sem dependência de Arduino.h)
-include/Pins.h             pinout fixo do hardware
-lib/PwmTargetReader/        captura não-bloqueante do PWM em D2
-lib/DutyMapping/            duty% -> alvo de abertura (0..1)
-lib/CurrentSense/           ADC -> Amps (escala do BTS7960)
-lib/ModeSelection/          escolhe modo POSICAO vs TEMPO
-lib/DeadReckoning/          estimador de posição por tempo
-lib/PositionDeadband/       banda-morta de posição
-lib/Pid/                    controlador PID genérico
-lib/AnalogTargetMapping/    ADC do A4 -> duty% (simulação de bancada)
-src/ActuatorInterlock.*     o mutex D7/D9 (único lugar que toca no motor/sensor)
-src/CurrentSensing.*        leitura de corrente (A1/A2) e tensão de bateria (A3)
-src/TargetSource.*          alterna entre D2 (PWM real) e A4 (pot de bancada)
-src/HomingCalibration.*     varredura batente-a-batente na inicialização
-src/ValvePositionControl.*  loop de controle principal
-src/Logger.*                 log serial (eventos + telemetria throttled)
-src/main.cpp                 integração de tudo
-test/test_native/            testes unitários nativos (Unity), sem hardware
-openspec/                    proposta, specs, design e tasks desta implementação
+include/config.h          calibration constants (no Arduino.h dependency)
+include/Pins.h             fixed hardware pinout
+lib/PwmTargetReader/        non-blocking PWM capture on D2
+lib/DutyMapping/            duty% -> opening target (0..1)
+lib/CurrentSense/           ADC -> Amps (BTS7960 scale)
+lib/ModeSelection/          picks POSITION vs TIME mode
+lib/DeadReckoning/          time-based position estimator
+lib/PositionDeadband/       position dead-band
+lib/Pid/                    generic PID controller
+lib/AnalogTargetMapping/    A4 ADC -> duty% (bench simulation)
+src/ActuatorInterlock.*     the D7/D9 mutex (only place touching motor/sensor)
+src/CurrentSensing.*        current (A1/A2) and battery voltage (A3) reading
+src/TargetSource.*          switches between D2 (real PWM) and A4 (bench pot)
+src/HomingCalibration.*     stop-to-stop sweep at startup
+src/ValvePositionControl.*  main control loop
+src/Logger.*                 serial log (events + throttled telemetry)
+src/main.cpp                 wires everything together
+test/test_native/            native unit tests (Unity), no hardware
+openspec/                    proposal, specs, design and tasks for this implementation
 ```
 
-## Status atual e próximos passos
+## Current status and next steps
 
-O firmware está implementado e compila limpo (`pio run`), com 19 testes
-unitários nativos passando (`pio test -e native`) cobrindo toda a lógica
-pura. O que ainda falta é **verificação em bancada com hardware real**:
-confirmar no osciloscópio/multímetro que `D7`/`D9` nunca se sobrepõem,
-calibrar os tempos e limiares de corrente, e validar os dois modos de
-controle, o holding nos batentes, a falha de meio-curso e o fail-safe do
-sinal do D2. O checklist completo está em
+The firmware is implemented and builds clean (`pio run`), with 19 native
+unit tests passing (`pio test -e native`) covering all the pure logic. What's
+still missing is **bench verification with real hardware**: confirming on an
+oscilloscope/multimeter that `D7`/`D9` never overlap, calibrating the
+timings and current thresholds, and validating both control modes, holding
+at the stops, the mid-travel fault, and the D2 signal fail-safe. The full
+checklist is in
 `openspec/changes/exhaust-valve-controller/tasks.md` (item 8.2).
