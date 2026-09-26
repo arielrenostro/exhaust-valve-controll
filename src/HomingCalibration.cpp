@@ -190,6 +190,12 @@ namespace HomingCalibration
     {
         Logger::event(F("homing: start"));
 
+        if (cfg::PID_BENCH_TEST_MODE)
+        {
+            Logger::event(F("homing: bench test mode, skipping drive, using fixed calibration"));
+            return Result{cfg::PID_BENCH_TEST_CLOSED_RAW, cfg::PID_BENCH_TEST_OPEN_RAW, 0, 0, ControlMode::Position};
+        }
+
         Logger::event(String(F("homing: pre open kick")));
         preOpenKick();
 

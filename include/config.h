@@ -91,6 +91,17 @@ namespace cfg
 
     constexpr uint8_t MOTOR_DRIVE_DUTY_PERCENT = 40; // fixed duty used for open-loop (TIME mode) driving
 
+    // ---- PID bench test (TEMPORARY - revert before real homing returns) ----
+    // No mechanical stops available on the bench (hand-held potentiometer on
+    // the motor shaft instead of the valve's own position sensor), so
+    // current-stall homing doesn't apply. When true, HomingCalibration skips
+    // all driving and returns a fixed calibration instead, using 20%-80% of
+    // the ADC range as a safety margin against the test potentiometer's own
+    // end stops.
+    constexpr bool PID_BENCH_TEST_MODE = true;
+    constexpr int PID_BENCH_TEST_CLOSED_RAW = 460;
+    constexpr int PID_BENCH_TEST_OPEN_RAW = 900; 
+
     // ---- Homing (specs/exhaust-valve/homing-calibration) ----
     // Independent of MOTOR_DRIVE_DUTY_PERCENT on purpose: homing only runs
     // briefly (boot / re-home), so it can afford a higher duty than
